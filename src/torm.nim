@@ -2,41 +2,40 @@ import db_sqlite, json
 from strutils import parseInt
 
 type
+    Tfield = tuple[name: string, kind: string]
+
+    Tindex = tuple[name: string, fields: seq[Tfield]]
+
     Tmodel* = ref object of RootObj
-        Tname*: string
-        Tfields*: seq[tuple[name: string, kind: string]]
         id*: int64
 
-proc Tinit*[T: Tmodel](this: T, fresh = true): T {.discardable.} =
-    this.Tname = $typedesc(this)
-    if fresh: this.id = -1
-    for col, value in this[].fieldPairs:
-        if col != "Tfields" and col != "Tname":
-            this.Tfields.add((name: col, kind: $typeof(value)))
-    result = this
-
-proc Trow[T: Tmodel](this: T, row: seq[string]): T =
-    var json = "{\"Tname\": \"\", \"Tfields\": [], \"id\": " & row[0]
-    var i = 1
-    for col in this.Tfields:
-        if col.name != "Tfields" and col.name != "Tname" and col.name != "id":
-            json &= ", \"" & col.name & "\": " & (if col.kind == "string": escapeJson row[i] else: escapeJsonUnquoted row[i])
-            i += 1
-    result = to(parseJson(json & "}"), T)
-    result.Tinit(false)
-
-type
     Torm* = ref object
         db: DbConn
+        lookup: seq[Tindex]
 
     Torder* = enum
         Asc = " ASC ", Desc = " DESC "
 
-proc columnInfo(this: Torm, column: tuple[name: string, kind: string]): string =
-    if column.name == "id":
+proc Tinit*[T: Tmodel](self: T): Tindex =
+    ## Make an Tindex of the Tmodel which can be used inside by Torm.lookup
+    result = (name: $typedesc(self), fields: @[])
+    for col, value in self[].fieldPairs:
+        result.fields.add((name: col, kind: $typeof(value)))
+
+proc Trow[T: Tmodel](self: T, row: seq[string], index: Tindex): T =
+    var json = "{\"id\": " & row[0]
+    var i = 1
+    for field in index.fields:
+        if field.name != "id":
+            json &= ", \"" & field.name & "\": " & (if field.kind == "string": escapeJson row[i] else: escapeJsonUnquoted row[i])
+            i += 1
+    result = to(parseJson(json & "}"), T)
+
+proc fieldInfo(this: Torm, field: Tfield): string =
+    if field.name == "id":
         result = "INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL"
     else:
-        result = case column.kind:
+        result = case field.kind:
             of "bool":
                 "BOOLEAN NOT NULL DEFAULT false"
             of "int8", "int16", "int32", "int64", "int":
@@ -44,66 +43,71 @@ proc columnInfo(this: Torm, column: tuple[name: string, kind: string]): string =
             else:
                 "TEXT"
 
-proc newTorm*[T: Tmodel](dbName: string, models: varargs[T]): Torm =
-    let db = open(dbName, "", "", "")
-    let orm = Torm(db: db)
+proc getIndex(self: Torm, q: string): Tindex =
+    for match in self.lookup:
+        if q == match.name:
+            result = match
 
-    for model in models:
+proc newTorm*(dbName: string, lookup: seq[Tindex]): Torm =
+    let db = open(dbName, "", "", "")
+    let orm = Torm(db: db, lookup: lookup)
+
+    for model in lookup:
         var list: seq[string] = @[]
-        for row in db.fastRows(sql("PRAGMA table_info(" & model.Tname & ");")):
+        for row in db.fastRows(sql("PRAGMA table_info(" & model.name & ");")):
             list.add(row[1])
         if list.len > 0:
             # Lets check if new columns have been added
-            for column in model.Tfields:
-                if not list.contains(column.name):
-                    var statement = "ALTER TABLE \"" & model.Tname & "\" ADD COLUMN " & column.name & " " & orm.columnInfo(column) & ";"
+            for field in model.fields:
+                if not list.contains(field.name):
+                    var statement = "ALTER TABLE \"" & model.name & "\" ADD COLUMN " & field.name & " " & orm.fieldInfo(field) & ";"
                     db.exec(sql(statement))
 
         else:
             # Lets make a new table
-            var statement = "CREATE TABLE IF NOT EXISTS \"" & model.Tname & "\" ("
-            for column in model.Tfields:
+            var statement = "CREATE TABLE IF NOT EXISTS \"" & model.name & "\" ("
+            for field in model.fields:
                 if statement[^1] != '(': statement &= ", "
-                statement &= "\"" & column.name & "\" " & orm.columnInfo(column)
+                statement &= "\"" & field.name & "\" " & orm.fieldInfo(field)
             statement &= ");"
             db.exec(sql(statement))
 
     return orm
 
-proc insert[T: Tmodel](this: Torm, model: T): int64 {.discardable.} =
-    var statement = "INSERT INTO \"" & model.Tname & "\" ("
+proc insert[T: Tmodel](self: Torm, model: T): int64 {.discardable.} =
+    var statement = "INSERT INTO \"" & $typedesc(model) & "\" ("
     var late = " VALUES ("
     var list: seq[string] = @[]
     for col, value in model[].fieldPairs:
-        if col != "Tfields" and col != "Tname" and col != "id":
+        if col != "id":
             if statement[^1] != '(': statement &= ", "
             statement &= col
             if late[^1] != '(': late &= ", "
             late &= "?"
             list.add($value)
     let prepared = statement & ")" & late & ")"
-    model.id = this.db.tryInsertID(sql prepared, list)
+    model.id = self.db.tryInsertID(sql prepared, list)
     result = model.id
 
-proc update[T: Tmodel](this: Torm, model: T): bool {.discardable.} =
-    var statement = "UPDATE \"" & model.Tname & "\" SET "
+proc update[T: Tmodel](self: Torm, model: T): bool {.discardable.} =
+    var statement = "UPDATE \"" & $typedesc(model) & "\" SET "
     var list: seq[string] = @[]
     for col, value in model[].fieldPairs:
-        if col != "Tfields" and col != "Tname" and col != "id":
+        if col != "id":
             if statement[^1] != ' ': statement &= ", "
             statement &= col & " = ?"
             list.add($value)
     list.add($model.id)
     statement &= " WHERE id = ?"
-    echo statement
-    result = this.db.tryExec(sql statement, list)
+    result = self.db.tryExec(sql statement, list)
 
-proc find[T: Tmodel](this: Torm, model: T, where = (clause: "", values: @[""]), order = (by: "id", way: Torder.Asc), limit = 0, offset = 0, countOnly = false): tuple[count: int, objects: seq[T]] =
+proc find[T: Tmodel](self: Torm, model: T, where = (clause: "", values: @[""]), order = (by: "id", way: Torder.Asc), limit = 0, offset = 0, countOnly = false): tuple[count: int, objects: seq[T]] =
+    let index = self.getIndex($typedesc(model))
     var select = "id"
-    for col in model.Tfields:
-        if col.name != "id": select &= "," & col.name
+    for field in index.fields:
+        if field.name != "id": select &= "," & field.name
     if countOnly: select = "COUNT(*) AS total"
-    select = "SELECT " & select & " FROM \"" & model.Tname & "\""
+    select = "SELECT " & select & " FROM \"" & index.name & "\""
     if where.clause != "":
         select &= " WHERE " & where.clause
     select &= " ORDER BY " & order.by & $order.way
@@ -111,9 +115,9 @@ proc find[T: Tmodel](this: Torm, model: T, where = (clause: "", values: @[""]), 
         if limit > 0: select &= " LIMIT " & $limit
         if offset > 0: select &= " OFFSET " & $offset
 
-    for x in this.db.fastRows(sql select, where.values):
+    for x in self.db.fastRows(sql select, where.values):
         if not countOnly:
-            result.objects.add T().Tinit().Trow(x)
+            result.objects.add T().Trow(x, index)
             result.count += 1
         else:
             result.count = parseInt x[0]
@@ -134,12 +138,13 @@ proc countBy*[T: Tmodel](this: Torm, model: T, where: string, values: seq[string
     result = this.find(model, where = (clause: where, values: values)).count
 
 proc save*[T: Tmodel](this: Torm, model: T) =
-    if model.id == -1:
+    if model.id == 0:
         this.insert(model) > -1
     else:
         this.update(model)
 
 proc delete*[T: Tmodel](this: Torm, model: T) =
-    var statement = "DELETE FROM \"" & model.Tname & "\" WHERE id = ?"
+    var statement = "DELETE FROM \"" & $typedesc(model) & "\" WHERE id = ?"
     if model.id != -1:
         this.db.exec(sql statement, @[model.id])
+

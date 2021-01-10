@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.1.1"
+version       = "0.2.0"
 author        = "enimatek"
 description   = "Tiny object relational mapper for SQLite in Nim."
 license       = "MIT"
